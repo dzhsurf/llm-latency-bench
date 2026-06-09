@@ -6,6 +6,7 @@ from rich.panel import Panel
 from llm_bench.clients.base import StreamResult
 from llm_bench.config import BenchConfig
 from llm_bench.datasets import DatasetItem
+from llm_bench.metrics import LoadSummary, format_tpot_value, format_tps
 
 
 def _fmt_ms(value: float | None) -> str:
@@ -17,9 +18,7 @@ def _fmt_ms(value: float | None) -> str:
 
 
 def _fmt_tps(value: float | None) -> str:
-    if value is None:
-        return "n/a"
-    return f"{value:.1f} t/s"
+    return format_tps(value)
 
 
 def _fmt_tokens(value: int) -> str:
@@ -67,6 +66,19 @@ class BenchConsole:
         )
         self._print(Panel(body, title="LLM Benchmark", border_style="cyan"))
 
+    def load_banner(self, config: BenchConfig, *, item_count: int) -> None:
+        load = config.load_test
+        rates = ", ".join(str(r) for r in load.request_rate_sweep)
+        body = (
+            f"Endpoint: {config.endpoint.base_url} ({config.endpoint.api_type})\n"
+            f"Model: {config.endpoint.model}\n"
+            f"Items: {item_count}  |  Duration: {load.duration_s}s  |  Warmup: {load.warmup_s}s\n"
+            f"Request rates: {rates}\n"
+            f"Cache hit ratio: {load.cache_hit_ratio:.0%}\n"
+            f"Max concurrency: {load.max_concurrency or 'unlimited'}"
+        )
+        self._print(Panel(body, title="Load Test", border_style="magenta"))
+
     def item_start(
         self,
         *,
@@ -98,13 +110,28 @@ class BenchConsole:
         )
 
     def request_done(self, *, label: str, result: StreamResult, elapsed_s: float) -> None:
+        ttft_display = result.ttft_corrected_ms if result.ttft_corrected_ms is not None else result.ttft_ms
         parts = [
-            f"ttft={_fmt_ms(result.ttft_ms)}",
+            f"ttft={_fmt_ms(ttft_display)}",
             f"latency={_fmt_ms(result.total_latency_ms)}",
             f"out={result.output_tokens}",
         ]
+        if (
+            result.ttft_ms is not None
+            and result.ttft_corrected_ms is not None
+            and abs(result.ttft_ms - result.ttft_corrected_ms) > 1
+        ):
+            parts.append(f"raw={_fmt_ms(result.ttft_ms)}")
         if result.decode_tps is not None:
-            parts.append(f"decode={_fmt_tps(result.decode_tps)}")
+            parts.append(f"tps={_fmt_tps(result.decode_tps)}")
+        if result.decode_tps_e2e is not None:
+            parts.append(f"[dim]e2e={_fmt_tps(result.decode_tps_e2e)}[/dim]")
+        if result.tpot_ms is not None:
+            parts.append(f"tpot={format_tpot_value(result.tpot_ms)} ms/tok")
+        if result.decode_buffered:
+            parts.append("[buffered]")
+        elif not result.decode_reliable and result.decode_tps is not None:
+            parts.append("[unreliable]")
         if result.cached_tokens:
             parts.append(f"cached={_fmt_tokens(result.cached_tokens)}")
         if result.input_tokens:
@@ -121,6 +148,31 @@ class BenchConsole:
 
     def throughput_start(self, *, concurrency: int) -> None:
         self._print(f"  [dim]throughput x{concurrency}[/dim]")
+
+    def load_point_start(self, *, rate: float, duration_s: int) -> None:
+        rate_label = "inf" if rate == float("inf") else f"{rate:.1f}/s"
+        self._print(f"\n[bold magenta]Load point[/bold magenta]  rate={rate_label}  duration={duration_s}s")
+
+    def load_progress(
+        self,
+        *,
+        elapsed_s: float,
+        duration_s: int,
+        in_flight: int,
+        completed: int,
+    ) -> None:
+        self._print(
+            f"  [dim]load {elapsed_s:.0f}/{duration_s}s  "
+            f"in_flight={in_flight}  completed={completed}[/dim]"
+        )
+
+    def load_point_done(self, *, summary: LoadSummary) -> None:
+        self._print(
+            f"  [green]done[/green]  achieved={summary.achieved_rate:.2f}/s  "
+            f"out_tput={summary.output_throughput:.2f} tok/s  "
+            f"goodput={summary.goodput:.2f}/s  "
+            f"reqs={summary.total_requests}  slo_ok={summary.slo_ok_count}"
+        )
 
     def done(self, *, record_count: int, elapsed_s: float) -> None:
         self._print(

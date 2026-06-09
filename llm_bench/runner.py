@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import random
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from llm_bench.cache_buster import make_cache_buster
-from llm_bench.clients import BaseClient, StreamResult, create_client
+from llm_bench.clients import BaseClient, DecodeCalcConfig, StreamResult, create_client
 from llm_bench.config import BenchConfig
 from llm_bench.console_log import BenchConsole
 from llm_bench.datasets import DatasetItem, filter_items, load_manifest
-from llm_bench.metrics import StatSummary, summarize
+from llm_bench.metrics import (
+    LoadSLOConfig,
+    LoadSummary,
+    StatSummary,
+    check_slo,
+    compute_load_tpot_ms,
+    summarize,
+    summarize_load_records,
+)
 
 SYSTEM_PROMPT = (
     "You are an expert technical assistant. Read the user's materials carefully "
@@ -39,6 +49,30 @@ class RunRecord:
     input_tokens: int
     cached_tokens: int
     total_latency_ms: float
+    ttft_corrected_ms: float | None = None
+    decode_est_ms: float | None = None
+    decode_buffered: bool = False
+    decode_tps_e2e: float | None = None
+    tpot_ms: float | None = None
+    decode_reliable: bool = True
+    error: str | None = None
+
+
+@dataclass
+class LoadRecord:
+    domain: str
+    output_style: str
+    target_tokens: int
+    cache_mode: str
+    request_rate: float
+    ttft_ms: float | None
+    tpot_ms: float | None
+    output_tokens: int
+    input_tokens: int
+    cached_tokens: int
+    total_latency_ms: float
+    start_offset_s: float
+    slo_ok: bool
     error: str | None = None
 
 
@@ -51,8 +85,14 @@ class GroupSummary:
     cache_mode: str | None
     concurrency: int
     ttft: StatSummary
+    ttft_corrected: StatSummary
     decode_tps: StatSummary
+    decode_tps_all: StatSummary
+    tpot: StatSummary
     cached_tokens: StatSummary
+    reliable_count: int = 0
+    buffered_count: int = 0
+    total_count: int = 0
     records: list[RunRecord] = field(default_factory=list)
 
 
@@ -75,6 +115,14 @@ def aggregate_records(records: list[RunRecord]) -> list[GroupSummary]:
     summaries: list[GroupSummary] = []
     for key, group_records in sorted(groups.items()):
         domain, target_tokens, output_style, mode, cache_mode, concurrency = key
+        reliable = [r for r in group_records if r.decode_reliable and r.decode_tps is not None]
+        decode_all = [r for r in group_records if r.decode_tps is not None]
+        tpot_reliable = [r for r in reliable if r.tpot_ms is not None]
+
+        ttft_corr_reliable = [
+            r for r in reliable if r.ttft_corrected_ms is not None
+        ]
+
         summaries.append(
             GroupSummary(
                 domain=domain,
@@ -84,8 +132,16 @@ def aggregate_records(records: list[RunRecord]) -> list[GroupSummary]:
                 cache_mode=cache_mode,
                 concurrency=concurrency,
                 ttft=summarize(r.ttft_ms for r in group_records),
-                decode_tps=summarize(r.decode_tps for r in group_records),
+                ttft_corrected=summarize(
+                    r.ttft_corrected_ms for r in ttft_corr_reliable or group_records
+                ),
+                decode_tps=summarize(r.decode_tps for r in reliable),
+                decode_tps_all=summarize(r.decode_tps_e2e for r in decode_all),
+                tpot=summarize(r.tpot_ms for r in tpot_reliable),
                 cached_tokens=summarize(float(r.cached_tokens) for r in group_records),
+                reliable_count=len(reliable),
+                buffered_count=sum(1 for r in group_records if r.decode_buffered),
+                total_count=len(group_records),
                 records=group_records,
             )
         )
@@ -96,14 +152,24 @@ class BenchmarkRunner:
     def __init__(self, config: BenchConfig, *, verbose: bool = True) -> None:
         self.config = config
         self.log = BenchConsole(enabled=verbose)
+        decode_calc = DecodeCalcConfig(
+            burst_factor=config.run.decode_burst_factor,
+            trim_head_ratio=config.run.decode_trim_head_ratio,
+            trim_tail_ratio=config.run.decode_trim_tail_ratio,
+            min_chunks=config.run.decode_min_chunks,
+            buffered_threshold=config.run.decode_buffered_threshold,
+        )
         self.client: BaseClient = create_client(
             config.endpoint.api_type,
             config.endpoint.base_url,
             config.endpoint.api_key,
             config.endpoint.model,
             float(config.run.request_timeout_s),
+            decode_calc,
         )
         self.records: list[RunRecord] = []
+        self.load_records: list[LoadRecord] = []
+        self.load_summaries: list[LoadSummary] = []
 
     def _resolved_domains(self) -> dict[str, list[int]]:
         return {
@@ -136,7 +202,13 @@ class BenchmarkRunner:
             repeat_index=repeat_index,
             max_tokens=max_tokens,
             ttft_ms=result.ttft_ms,
+            ttft_corrected_ms=result.ttft_corrected_ms,
+            decode_est_ms=result.decode_est_ms,
+            decode_buffered=result.decode_buffered,
             decode_tps=result.decode_tps,
+            decode_tps_e2e=result.decode_tps_e2e,
+            tpot_ms=result.tpot_ms,
+            decode_reliable=result.decode_reliable,
             output_tokens=result.output_tokens,
             input_tokens=result.input_tokens,
             cached_tokens=result.cached_tokens,
@@ -203,9 +275,11 @@ class BenchmarkRunner:
             max_tokens=self.config.run.decode_max_tokens,
             result=result,
         )
-        # The TTFT row reports first-token latency only; decode TPS lives on the
-        # decode row so the two concerns stay separate in the report.
         ttft.decode_tps = None
+        ttft.decode_tps_e2e = None
+        ttft.tpot_ms = None
+        ttft.decode_est_ms = None
+        ttft.decode_buffered = False
         decode = self._make_record(
             item=item,
             mode="decode",
@@ -224,25 +298,6 @@ class BenchmarkRunner:
         concurrency: int,
         repeat_index: int,
     ) -> list[RunRecord]:
-        """One repeat using a unified, non-abort request shape.
-
-        A random cache buster (random bytes plus a time factor) is created per
-        repeat and appended to BOTH the system prompt and the user prompt, so the
-        pair is unique across repeats but identical within a repeat. Both calls
-        run the FULL decode (never abort): aborting after the first token would
-        prevent reading end-of-stream usage, so the prefix-cache hit rate
-        (cached_tokens) could not be confirmed on the warm call.
-
-          1. cold: first time this buster is seen -> prefix-cache MISS. Yields
-             TTFT miss, cached_tokens (expected 0), decode; also populates cache.
-          2. warm: identical system+user prompt -> prefix-cache HIT. Yields TTFT
-             hit, cached_tokens (> 0, confirming the hit), and decode.
-
-        Because both calls share the exact same request shape and max_tokens, the
-        TTFT miss vs hit comparison is apples-to-apples at every context length.
-        Decode is reported for both; cache only affects prefill, so the hit decode
-        is the primary decode-speed metric.
-        """
         caching = self.config.matrix.test_prefix_caching
         buster = make_cache_buster(fixed=False)
         system_prompt = buster + SYSTEM_PROMPT
@@ -331,6 +386,204 @@ class BenchmarkRunner:
 
         return await asyncio.gather(*[one() for _ in range(concurrency)])
 
+    def _filter_items_for_run(
+        self,
+        *,
+        domain_filter: str | None,
+        length_filter: int | None,
+    ) -> list[DatasetItem]:
+        items = filter_items(load_manifest(), domains=self._resolved_domains())
+        if domain_filter:
+            items = [i for i in items if i.domain == domain_filter]
+        if length_filter is not None:
+            items = [i for i in items if i.target_tokens == length_filter]
+
+        max_cases = self.config.run.max_cases_per_length
+        if max_cases is not None:
+            seen: dict[tuple[str, int], int] = {}
+            limited: list[DatasetItem] = []
+            for item in sorted(items, key=lambda i: (i.domain, i.target_tokens, i.case_index)):
+                key = (item.domain, item.target_tokens)
+                if seen.get(key, 0) >= max_cases:
+                    continue
+                seen[key] = seen.get(key, 0) + 1
+                limited.append(item)
+            items = limited
+        return items
+
+    def _filter_items_for_load(self) -> list[DatasetItem]:
+        items = self._filter_items_for_run(domain_filter=None, length_filter=None)
+        sample_domains = self.config.load_test.sample_domains
+        if sample_domains:
+            items = [i for i in items if i.domain in sample_domains]
+        return items
+
+    async def _run_load_point(
+        self,
+        rate: float,
+        items: list[DatasetItem],
+    ) -> tuple[list[LoadRecord], LoadSummary]:
+        load_cfg = self.config.load_test
+        duration_s = load_cfg.duration_s
+        max_tokens = load_cfg.max_tokens or self.config.run.decode_max_tokens
+        slo = LoadSLOConfig(
+            ttft_ms=load_cfg.slo.ttft_ms,
+            tpot_ms=load_cfg.slo.tpot_ms,
+        )
+
+        sent_pool: list[tuple[str, str, DatasetItem]] = []
+        records: list[LoadRecord] = []
+        in_flight: set[asyncio.Task[LoadRecord]] = set()
+        sem = (
+            asyncio.Semaphore(load_cfg.max_concurrency)
+            if load_cfg.max_concurrency
+            else None
+        )
+
+        start_wall = time.perf_counter()
+        stop_at = start_wall + duration_s
+        last_progress = start_wall
+
+        async def execute_one(
+            system: str,
+            user: str,
+            item: DatasetItem,
+            cache_mode: str,
+            offset_s: float,
+        ) -> LoadRecord:
+            if sem:
+                async with sem:
+                    result = await self._run_once(
+                        user,
+                        system=system,
+                        max_tokens=max_tokens,
+                        abort_after_first_token=False,
+                    )
+            else:
+                result = await self._run_once(
+                    user,
+                    system=system,
+                    max_tokens=max_tokens,
+                    abort_after_first_token=False,
+                )
+
+            tpot = compute_load_tpot_ms(
+                result.total_latency_ms,
+                result.ttft_ms,
+                result.output_tokens,
+            )
+            slo_ok = (
+                check_slo(ttft_ms=result.ttft_ms, tpot_ms=tpot, slo=slo)
+                if result.error is None
+                else False
+            )
+            return LoadRecord(
+                domain=item.domain,
+                output_style=item.output_style,
+                target_tokens=item.target_tokens,
+                cache_mode=cache_mode,
+                request_rate=rate,
+                ttft_ms=result.ttft_ms,
+                tpot_ms=tpot,
+                output_tokens=result.output_tokens,
+                input_tokens=result.input_tokens,
+                cached_tokens=result.cached_tokens,
+                total_latency_ms=result.total_latency_ms,
+                start_offset_s=offset_s,
+                slo_ok=slo_ok,
+                error=result.error,
+            )
+
+        def pick_prompt() -> tuple[str, str, DatasetItem, str]:
+            hit = sent_pool and random.random() < load_cfg.cache_hit_ratio
+            if hit:
+                system, user, item = random.choice(sent_pool)
+                return system, user, item, "hit"
+            item = random.choice(items)
+            buster = make_cache_buster(fixed=False)
+            system = buster + SYSTEM_PROMPT
+            user = buster + item.prompt
+            sent_pool.append((system, user, item))
+            return system, user, item, "miss"
+
+        def _on_task_done(task: asyncio.Task[LoadRecord]) -> None:
+            in_flight.discard(task)
+            try:
+                records.append(task.result())
+            except Exception as exc:  # noqa: BLE001
+                records.append(
+                    LoadRecord(
+                        domain="",
+                        output_style="",
+                        target_tokens=0,
+                        cache_mode="miss",
+                        request_rate=rate,
+                        ttft_ms=None,
+                        tpot_ms=None,
+                        output_tokens=0,
+                        input_tokens=0,
+                        cached_tokens=0,
+                        total_latency_ms=0.0,
+                        start_offset_s=0.0,
+                        slo_ok=False,
+                        error=str(exc),
+                    )
+                )
+
+        self.log.load_point_start(rate=rate, duration_s=duration_s)
+
+        while time.perf_counter() < stop_at:
+            offset_s = time.perf_counter() - start_wall
+            system, user, item, cache_mode = pick_prompt()
+
+            task = asyncio.create_task(
+                execute_one(system, user, item, cache_mode, offset_s)
+            )
+            in_flight.add(task)
+            task.add_done_callback(_on_task_done)
+
+            now = time.perf_counter()
+            if now - last_progress >= 5.0:
+                self.log.load_progress(
+                    elapsed_s=now - start_wall,
+                    duration_s=duration_s,
+                    in_flight=len(in_flight),
+                    completed=len(records),
+                )
+                last_progress = now
+
+            if math.isinf(rate):
+                await asyncio.sleep(0)
+            else:
+                interval = random.expovariate(rate)
+                await asyncio.sleep(interval)
+
+        if in_flight:
+            await asyncio.gather(*in_flight, return_exceptions=True)
+
+        # Filter warmup window
+        warmup_s = load_cfg.warmup_s
+        filtered = [r for r in records if r.start_offset_s >= warmup_s]
+        if not filtered:
+            filtered = records
+
+        window_s = duration_s - warmup_s if duration_s > warmup_s else duration_s
+        summary = summarize_load_records(filtered, request_rate=rate, window_s=window_s)
+        self.log.load_point_done(summary=summary)
+        return filtered, summary
+
+    async def run_load(self) -> None:
+        items = self._filter_items_for_load()
+        if not items:
+            self.log.no_items()
+            return
+
+        self.log.load_banner(self.config, item_count=len(items))
+        for rate in self.config.load_test.request_rate_sweep:
+            records, summary = await self._run_load_point(rate, items)
+            self.load_records.extend(records)
+            self.load_summaries.append(summary)
+
     async def run_item_serial(self, item: DatasetItem, concurrency: int) -> None:
         for w in range(self.config.run.warmup):
             self.log.warmup(round_index=w, total=self.config.run.warmup)
@@ -357,23 +610,15 @@ class BenchmarkRunner:
         self.records.extend(await self._run_concurrent_throughput(item, concurrency))
 
     async def run(self, *, domain_filter: str | None = None, length_filter: int | None = None) -> list[RunRecord]:
-        items = filter_items(load_manifest(), domains=self._resolved_domains())
-        if domain_filter:
-            items = [i for i in items if i.domain == domain_filter]
-        if length_filter is not None:
-            items = [i for i in items if i.target_tokens == length_filter]
+        if self.config.load_test.enabled:
+            await self.run_load()
+            self.elapsed_s = 0.0
+            return self.records
 
-        max_cases = self.config.run.max_cases_per_length
-        if max_cases is not None:
-            seen: dict[tuple[str, int], int] = {}
-            limited: list[DatasetItem] = []
-            for item in sorted(items, key=lambda i: (i.domain, i.target_tokens, i.case_index)):
-                key = (item.domain, item.target_tokens)
-                if seen.get(key, 0) >= max_cases:
-                    continue
-                seen[key] = seen.get(key, 0) + 1
-                limited.append(item)
-            items = limited
+        items = self._filter_items_for_run(
+            domain_filter=domain_filter,
+            length_filter=length_filter,
+        )
 
         self.log.banner(
             self.config,
@@ -410,11 +655,12 @@ class BenchmarkRunner:
         return aggregate_records(self.records)
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "config": {
                 "endpoint": self.config.endpoint.model_dump(),
                 "run": self.config.run.model_dump(),
                 "matrix": self.config.matrix.model_dump(),
+                "load": self.config.load_test.model_dump(),
             },
             "elapsed_s": getattr(self, "elapsed_s", None),
             "records": [asdict(r) for r in self.records],
@@ -426,10 +672,37 @@ class BenchmarkRunner:
                     "mode": s.mode,
                     "cache_mode": s.cache_mode,
                     "concurrency": s.concurrency,
-                    "ttft": asdict(s.ttft),
+                    "ttft_observed": asdict(s.ttft),
+                    "ttft_corrected": asdict(s.ttft_corrected),
                     "decode_tps": asdict(s.decode_tps),
+                    "decode_tps_e2e": asdict(s.decode_tps_all),
+                    "tpot": asdict(s.tpot),
                     "cached_tokens": asdict(s.cached_tokens),
+                    "reliable_count": s.reliable_count,
+                    "buffered_count": s.buffered_count,
+                    "total_count": s.total_count,
                 }
                 for s in self.summaries()
             ],
         }
+        if self.load_records:
+            payload["load_records"] = [asdict(r) for r in self.load_records]
+        if self.load_summaries:
+            payload["load_summaries"] = [
+                {
+                    "request_rate": ls.request_rate,
+                    "window_s": ls.window_s,
+                    "achieved_rate": ls.achieved_rate,
+                    "output_throughput": ls.output_throughput,
+                    "total_throughput": ls.total_throughput,
+                    "goodput": ls.goodput,
+                    "ttft": asdict(ls.ttft),
+                    "tpot": asdict(ls.tpot),
+                    "tps": asdict(ls.tps),
+                    "total_requests": ls.total_requests,
+                    "slo_ok_count": ls.slo_ok_count,
+                    "by_domain": ls.by_domain,
+                }
+                for ls in self.load_summaries
+            ]
+        return payload

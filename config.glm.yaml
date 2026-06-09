@@ -1,7 +1,7 @@
 endpoint:
-  base_url: "http://127.0.0.1:7575"
+  base_url: "https://api.z.ai/api/anthropic"
   api_type: "anthropic"
-  api_key: "EMPTY"
+  api_key: "$GLM_API_KEY"
   model: "glm-4.7"
 
 run:

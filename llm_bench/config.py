@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 ALL_LENGTHS = [1024, 4096, 8192, 16384, 32768, 65536, 131072]
@@ -30,6 +30,11 @@ class RunConfig(BaseModel):
     request_timeout_s: int = 600
     concurrency_levels: list[int] = Field(default_factory=lambda: [1, 4])
     max_cases_per_length: int | None = None  # None = all cases; useful for smoke runs
+    decode_burst_factor: float = 0.5
+    decode_trim_head_ratio: float = 0.1
+    decode_trim_tail_ratio: float = 0.1
+    decode_min_chunks: int = 4
+    decode_buffered_threshold: float = 0.15
 
 
 class DomainMatrixEntry(BaseModel):
@@ -54,14 +59,34 @@ class MatrixConfig(BaseModel):
         return sorted(set(v))
 
 
+class LoadSLOConfig(BaseModel):
+    ttft_ms: float | None = None
+    tpot_ms: float | None = None
+
+
+class LoadConfig(BaseModel):
+    enabled: bool = False
+    request_rate_sweep: list[float] = Field(default_factory=lambda: [2.0, 8.0])
+    duration_s: int = 60
+    max_concurrency: int | None = None
+    cache_hit_ratio: float = 0.0
+    warmup_s: int = 0
+    slo: LoadSLOConfig = Field(default_factory=LoadSLOConfig)
+    sample_domains: list[str] | None = None
+    max_tokens: int | None = None
+
+
 class OutputConfig(BaseModel):
     dir: str = "results"
 
 
 class BenchConfig(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     endpoint: EndpointConfig
     run: RunConfig = Field(default_factory=RunConfig)
     matrix: MatrixConfig
+    load_test: LoadConfig = Field(default_factory=LoadConfig, alias="load")
     output: OutputConfig = Field(default_factory=OutputConfig)
 
     @model_validator(mode="after")

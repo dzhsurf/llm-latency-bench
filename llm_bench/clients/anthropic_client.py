@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 from llm_bench.clients.base import BaseClient, StreamResult
+from llm_bench.metrics import compute_decode_metrics
 
 
 class AnthropicClient(BaseClient):
@@ -37,7 +38,7 @@ class AnthropicClient(BaseClient):
 
         start = time.perf_counter()
         first_token_at: float | None = None
-        last_token_at: float | None = None
+        chunk_times: list[float] = []
         output_tokens = 0
         input_tokens = 0
         cached_tokens = 0
@@ -90,7 +91,7 @@ class AnthropicClient(BaseClient):
                                     if abort_after_first_token:
                                         aborted = True
                                         break
-                                last_token_at = now
+                                chunk_times.append(now - start)
                                 output_tokens = max(output_tokens, 1)
                         elif event_type == "message_delta":
                             usage = chunk.get("usage") or {}
@@ -108,18 +109,48 @@ class AnthropicClient(BaseClient):
         end = time.perf_counter()
         total_ms = (end - start) * 1000
         ttft_ms = (first_token_at - start) * 1000 if first_token_at else None
-        decode_tps = None
-        decode_end = last_token_at or end
-        if first_token_at and output_tokens > 1 and not aborted:
-            decode_seconds = decode_end - first_token_at
-            if decode_seconds > 0:
-                decode_tps = (output_tokens - 1) / decode_seconds
-        elif first_token_at and output_tokens == 1:
-            decode_tps = 0.0
+
+        decode_tps: float | None = None
+        decode_tps_e2e: float | None = None
+        tpot_ms: float | None = None
+        ttft_corrected_ms: float | None = None
+        decode_est_ms: float | None = None
+        decode_buffered = False
+        decode_reliable = True
+        n_chunks = len(chunk_times)
+
+        if not aborted and chunk_times and output_tokens > 0:
+            cfg = self.decode_calc
+            metrics = compute_decode_metrics(
+                chunk_times,
+                output_tokens,
+                ttft_ms,
+                total_ms,
+                burst_factor=cfg.burst_factor,
+                trim_head_ratio=cfg.trim_head_ratio,
+                trim_tail_ratio=cfg.trim_tail_ratio,
+                min_chunks=cfg.min_chunks,
+                buffered_threshold=cfg.buffered_threshold,
+            )
+            decode_tps = metrics.tps_steady
+            decode_tps_e2e = metrics.tps_e2e
+            tpot_ms = metrics.tpot_ms
+            ttft_corrected_ms = metrics.ttft_corrected_ms
+            decode_est_ms = metrics.decode_est_ms
+            decode_buffered = metrics.buffered
+            decode_reliable = metrics.reliable
+            n_chunks = metrics.n_chunks
 
         return StreamResult(
             ttft_ms=ttft_ms,
+            ttft_corrected_ms=ttft_corrected_ms,
+            decode_est_ms=decode_est_ms,
+            decode_buffered=decode_buffered,
             decode_tps=decode_tps,
+            decode_tps_e2e=decode_tps_e2e,
+            tpot_ms=tpot_ms,
+            decode_reliable=decode_reliable,
+            n_chunks=n_chunks,
             output_tokens=output_tokens,
             input_tokens=input_tokens,
             cached_tokens=cached_tokens,

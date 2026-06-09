@@ -1,0 +1,41 @@
+# Local bench — OpenAI API, vLLM on Linux/NVIDIA (e.g. RTX PRO 6000 96GB).
+# Model: qwen3.6-27b-fp8, context tiers 1k / 8k / 32k.
+#
+# Example serve (adjust HF path / flags to your deployment):
+#   vllm serve <hf-model-id> \
+#     --served-model-name qwen3.6-27b-fp8 \
+#     --max-model-len 32768 \
+#     --enable-prefix-caching \
+#     --port 8000
+#
+# Smoke:
+#   uv run python -m llm_bench --config config.qwen36-27b-fp8.openai.yaml --domain coding --length 1024
+#
+# Formal run (repeats 5, all 10 cases): bump repeats and remove max_cases_per_length.
+
+endpoint:
+  base_url: "http://127.0.0.1:8000/v1"
+  api_type: "openai"
+  api_key: "EMPTY"
+  model: "qwen3.6-27b-fp8"
+
+run:
+  repeats: 3
+  warmup: 1
+  decode_max_tokens: 2048
+  ttft_only_max_tokens: 1
+  request_timeout_s: 600
+  concurrency_levels: [1]
+  max_cases_per_length: 3
+
+matrix:
+  context_lengths: [1024, 8192, 32768]
+  domains:
+    coding:       { lengths: all }
+    doc_analysis: { lengths: all }
+    math:         { lengths: [1024] }
+    writing:      { lengths: [1024] }
+  test_prefix_caching: true
+
+output:
+  dir: "results"

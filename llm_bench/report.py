@@ -315,12 +315,28 @@ def print_console(summaries: list[GroupSummary], load_summaries: list | None = N
         console.print(load_table)
 
 
-def write_results(runner: BenchmarkRunner, output_dir: str | Path) -> dict[str, Path]:
-    out = Path(output_dir)
+def write_session_report(
+    runner: BenchmarkRunner,
+    session_dir: str | Path,
+    *,
+    print_summary: bool = False,
+) -> Path:
+    out = Path(session_dir)
     out.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    raw_path = out / f"raw_{stamp}.json"
-    report_path = out / f"report_{stamp}.md"
+    report_path = out / "report.md"
+    summaries = runner.summaries()
+    load_summaries = runner.load_summaries or None
+    report_path.write_text(build_markdown(summaries, load_summaries), encoding="utf-8")
+    if print_summary:
+        print_console(summaries, load_summaries)
+    return report_path
+
+
+def write_session_final(runner: BenchmarkRunner, session_dir: str | Path) -> dict[str, Path]:
+    out = Path(session_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    raw_path = out / "raw.json"
+    report_path = out / "report.md"
 
     payload: dict[str, Any] = runner.to_json()
     raw_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -330,9 +346,9 @@ def write_results(runner: BenchmarkRunner, output_dir: str | Path) -> dict[str, 
     report_path.write_text(build_markdown(summaries, load_summaries), encoding="utf-8")
     print_console(summaries, load_summaries)
 
-    latest_raw = out / "raw_latest.json"
-    latest_report = out / "report_latest.md"
-    latest_raw.write_text(raw_path.read_text(encoding="utf-8"), encoding="utf-8")
-    latest_report.write_text(report_path.read_text(encoding="utf-8"), encoding="utf-8")
-
     return {"raw": raw_path, "report": report_path}
+
+
+def write_results(runner: BenchmarkRunner, output_dir: str | Path) -> dict[str, Path]:
+    """Legacy entry point; delegates to session-style output in the given directory."""
+    return write_session_final(runner, output_dir)

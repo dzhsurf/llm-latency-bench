@@ -42,8 +42,25 @@ already-exported environment variables are used.
 
 ## Run
 
+Each run creates a **session** under `results/{session_id}/` (id format: `YYYYMMDD-xxxxxxxx`).
+Progress is checkpointed after every completed case (warmup + all repeats). You can stop
+with Ctrl+C after the current case finishes and resume later.
+
 ```bash
 python -m llm_bench --config config.yaml
+# Session: 20260609-a3f8c2e1  →  results/20260609-a3f8c2e1/
+```
+
+Resume a session:
+
+```bash
+python -m llm_bench --config config.yaml --resume 20260609-a3f8c2e1
+```
+
+Optional explicit session id for a new run:
+
+```bash
+python -m llm_bench --config config.yaml --session my-local-run-01
 ```
 
 Smoke a single case:
@@ -52,23 +69,33 @@ Smoke a single case:
 python -m llm_bench --config config.yaml --domain coding --length 1024
 ```
 
+`--resume` cannot be combined with `--domain` or `--length`.
+
 ## Datasets
 
-Static prompts live under `datasets/`. Each domain and context length has **10 distinct cases** (e.g. `coding/coding_1k_01.json` … `_10.json`), built from handwritten seed libraries in `scripts/seeds/`.
+Static prompts live under `datasets/`. Each domain and context length has **10 distinct cases** (e.g. `coding/coding_1k_01.json` … `_10.json`), built from handwritten seed libraries in `tools/seeds/`.
 
 Regenerate datasets during development (combiner only — does not author content):
 
 ```bash
-uv run python scripts/gen_datasets.py
+uv run python tools/gen_datasets.py
 ```
 
 The benchmark tool only reads `datasets/manifest.json` and prompt files at runtime.
 
 ## Output
 
-- `results/raw_*.json` — per-request metrics
-- `results/report_*.md` — aggregated tables
-- Console summary via Rich
+Per session (`results/{session_id}/`):
+
+| File | Description |
+|------|-------------|
+| `meta.json` | Config snapshot, planned workload, fingerprint |
+| `checkpoint.json` | Completed units and progress |
+| `records.jsonl` | Append-only per-unit metrics |
+| `report.md` | Aggregated tables (updated after each case) |
+| `raw.json` | Full export written when the session completes |
+
+Console summary via Rich prints on completion.
 
 ## Metrics
 

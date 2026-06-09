@@ -13,6 +13,7 @@ from llm_bench.clients import BaseClient, DecodeCalcConfig, StreamResult, create
 from llm_bench.config import BenchConfig
 from llm_bench.console_log import BenchConsole
 from llm_bench.datasets import DatasetItem, filter_items, load_manifest
+from llm_bench.session import SessionStore, plan_units, sort_items
 from llm_bench.metrics import (
     LoadSLOConfig,
     LoadSummary,
@@ -148,6 +149,10 @@ def aggregate_records(records: list[RunRecord]) -> list[GroupSummary]:
     return summaries
 
 
+def items_by_id(items: list[DatasetItem]) -> dict[str, DatasetItem]:
+    return {item.id: item for item in items}
+
+
 class BenchmarkRunner:
     def __init__(self, config: BenchConfig, *, verbose: bool = True) -> None:
         self.config = config
@@ -170,6 +175,8 @@ class BenchmarkRunner:
         self.records: list[RunRecord] = []
         self.load_records: list[LoadRecord] = []
         self.load_summaries: list[LoadSummary] = []
+        self.session: SessionStore | None = None
+        self.elapsed_s: float = 0.0
 
     def _resolved_domains(self) -> dict[str, list[int]]:
         return {
@@ -409,7 +416,7 @@ class BenchmarkRunner:
                 seen[key] = seen.get(key, 0) + 1
                 limited.append(item)
             items = limited
-        return items
+        return sort_items(items)
 
     def _filter_items_for_load(self) -> list[DatasetItem]:
         items = self._filter_items_for_run(domain_filter=None, length_filter=None)
@@ -609,10 +616,79 @@ class BenchmarkRunner:
         self.log.throughput_start(concurrency=concurrency)
         self.records.extend(await self._run_concurrent_throughput(item, concurrency))
 
-    async def run(self, *, domain_filter: str | None = None, length_filter: int | None = None) -> list[RunRecord]:
+    async def _run_work_unit(
+        self,
+        item: DatasetItem,
+        concurrency: int,
+        *,
+        progress_index: int,
+        progress_total: int,
+    ) -> None:
+        self.log.item_start(
+            index=progress_index,
+            total=progress_total,
+            item=item,
+            concurrency=concurrency,
+        )
+        records_before = len(self.records)
+        unit_started = time.perf_counter()
+        if concurrency == 1:
+            await self.run_item_serial(item, concurrency)
+        else:
+            await self.run_item_throughput(item, concurrency)
+        elapsed_delta = time.perf_counter() - unit_started
+
+        if self.session is not None:
+            new_records = self.records[records_before:]
+            self.session.append_unit(item.id, concurrency, new_records, elapsed_delta)
+            from llm_bench.report import write_session_report
+
+            write_session_report(self, self.session.path)
+
+    async def run(
+        self,
+        *,
+        session: SessionStore | None = None,
+        domain_filter: str | None = None,
+        length_filter: int | None = None,
+    ) -> list[RunRecord]:
+        self.session = session
+
         if self.config.load_test.enabled:
             await self.run_load()
             self.elapsed_s = 0.0
+            return self.records
+
+        if session is not None:
+            self.records = session.load_records()
+            self.elapsed_s = session.elapsed_s
+            lookup = items_by_id(load_manifest())
+            work = [
+                (lookup[u["dataset_id"]], int(u["concurrency"]))
+                for u in session.remaining_units()
+                if u["dataset_id"] in lookup
+            ]
+            progress_total = session.total_units
+            self.log.banner(
+                self.config,
+                item_count=len(work),
+                domain_filter=domain_filter,
+                length_filter=length_filter,
+            )
+            if not work:
+                self.log.done(record_count=len(self.records), elapsed_s=self.elapsed_s)
+                return self.records
+
+            for wi, (item, concurrency) in enumerate(work, start=1):
+                await self._run_work_unit(
+                    item,
+                    concurrency,
+                    progress_index=session.completed_count + wi,
+                    progress_total=progress_total,
+                )
+
+            self.elapsed_s = session.elapsed_s
+            self.log.done(record_count=len(self.records), elapsed_s=self.elapsed_s)
             return self.records
 
         items = self._filter_items_for_run(
@@ -632,23 +708,19 @@ class BenchmarkRunner:
             return self.records
 
         started = time.perf_counter()
-        total = len(items)
-        for index, item in enumerate(items, start=1):
-            for concurrency in self.config.run.concurrency_levels:
-                self.log.item_start(
-                    index=index,
-                    total=total,
-                    item=item,
-                    concurrency=concurrency,
-                )
-                if concurrency == 1:
-                    await self.run_item_serial(item, concurrency)
-                else:
-                    await self.run_item_throughput(item, concurrency)
+        units = plan_units(items, self.config.run.concurrency_levels)
+        total = len(units)
+        for unit_index, unit in enumerate(units, start=1):
+            item = items_by_id(items)[unit["dataset_id"]]
+            await self._run_work_unit(
+                item,
+                int(unit["concurrency"]),
+                progress_index=unit_index,
+                progress_total=total,
+            )
 
-        elapsed = time.perf_counter() - started
-        self.elapsed_s = elapsed
-        self.log.done(record_count=len(self.records), elapsed_s=elapsed)
+        self.elapsed_s = time.perf_counter() - started
+        self.log.done(record_count=len(self.records), elapsed_s=self.elapsed_s)
         return self.records
 
     def summaries(self) -> list[GroupSummary]:

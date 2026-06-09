@@ -1,26 +1,26 @@
-from scripts.seeds.coding import (
+from tools.seeds.coding import (
     CODING_NORMAL_TASKS,
     CODING_SEEDS,
     CODING_STRUCTURED_TASKS,
     CODING_TASKS,
 )
-from scripts.seeds.doc_analysis import (
+from tools.seeds.doc_analysis import (
     DOC_NORMAL_TASKS,
     DOC_SEEDS,
     DOC_STRUCTURED_TASKS,
     DOC_TASKS,
 )
-from scripts.seeds.math import (
+from tools.seeds.math import (
     MATH_NORMAL_INSTRUCTIONS,
     MATH_SEEDS,
     MATH_STRUCTURED_INSTRUCTIONS,
 )
-from scripts.seeds.writing import (
+from tools.seeds.writing import (
     WRITING_NORMAL_INSTRUCTIONS,
     WRITING_SEEDS,
     WRITING_STRUCTURED_INSTRUCTIONS,
 )
-from scripts.seeds.types import Seed
+from tools.seeds.types import Seed
 
 __all__ = [
     "Seed",

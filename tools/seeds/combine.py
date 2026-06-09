@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
-from scripts.seeds.types import Seed
+from tools.seeds.types import Seed
 
 TOLERANCE = 0.05
 

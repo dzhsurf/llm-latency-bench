@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from scripts.seeds.types import Seed
+from tools.seeds.types import Seed
 
 CODING_NORMAL_TASKS = [
     (

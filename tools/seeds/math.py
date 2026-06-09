@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from scripts.seeds.types import Seed
+from tools.seeds.types import Seed
 
 MATH_NORMAL_INSTRUCTIONS = [
     (

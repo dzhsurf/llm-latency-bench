@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.seeds import (
+from tools.seeds import (
     CODING_NORMAL_TASKS,
     CODING_SEEDS,
     CODING_STRUCTURED_TASKS,
@@ -28,7 +28,7 @@ from scripts.seeds import (
     WRITING_SEEDS,
     WRITING_STRUCTURED_INSTRUCTIONS,
 )
-from scripts.seeds.combine import assemble_prompt, build_body, rotate_seeds, select_for_target
+from tools.seeds.combine import assemble_prompt, build_body, rotate_seeds, select_for_target
 
 COUNT_TOKENS_URL = "http://127.0.0.1:7575/anthropic/v1/messages/count_tokens"
 MODEL = "glm-4.7"

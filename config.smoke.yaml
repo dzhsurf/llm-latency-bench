@@ -1,0 +1,24 @@
+endpoint:
+  base_url: "http://127.0.0.1:7575/v1"
+  api_type: "openai"
+  api_key: "EMPTY"
+  model: "glm-4.7"
+
+run:
+  repeats: 1
+  warmup: 0
+  decode_max_tokens: 2048      # large, so decode runs long enough to be measurable
+  ttft_only_max_tokens: 1
+  request_timeout_s: 600
+  concurrency_levels: [1]
+  max_cases_per_length: 1      # smoke: 1 case per length (formal uses all 10)
+
+matrix:
+  # Real, large contexts so TTFT/cache effects are visible (not just 1k noise)
+  context_lengths: [1024, 8192, 32768, 131072]
+  domains:
+    coding: { lengths: [1024, 8192, 32768, 131072] }
+  test_prefix_caching: true
+
+output:
+  dir: "results"

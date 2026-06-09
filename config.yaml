@@ -1,0 +1,26 @@
+endpoint:
+  # openai: base_url includes /v1; anthropic: base_url is host only
+  base_url: "http://127.0.0.1:7575/v1"
+  api_type: "openai"          # openai | anthropic
+  api_key: "EMPTY"
+  model: "glm-4.7"
+
+run:
+  repeats: 5
+  warmup: 1
+  decode_max_tokens: 2048
+  ttft_only_max_tokens: 1
+  request_timeout_s: 600
+  concurrency_levels: [1, 4]  # 1=serial latency; >1=throughput
+
+matrix:
+  context_lengths: [1024, 4096, 8192, 16384, 32768, 65536, 131072]
+  domains:
+    coding:       { lengths: all }
+    doc_analysis: { lengths: all }
+    math:         { lengths: [1024] }
+    writing:      { lengths: [1024] }
+  test_prefix_caching: true
+
+output:
+  dir: "results"

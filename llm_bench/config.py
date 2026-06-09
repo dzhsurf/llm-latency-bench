@@ -1,10 +1,45 @@
 from __future__ import annotations
 
+import os
+import re
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
+from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_ENV_REF = re.compile(r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def load_project_env(*, config_path: Path | None = None) -> None:
+    """Load `.env` if present; values override the current process environment."""
+    candidates: list[Path] = []
+    if config_path is not None:
+        candidates.append(config_path.resolve().parent / ".env")
+    candidates.extend([_PROJECT_ROOT / ".env", Path.cwd() / ".env"])
+    seen: set[Path] = set()
+    for dotenv_path in candidates:
+        resolved = dotenv_path.resolve()
+        if resolved in seen or not resolved.is_file():
+            continue
+        seen.add(resolved)
+        load_dotenv(resolved, override=True)
+
+
+def expand_env_values(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {key: expand_env_values(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [expand_env_values(value) for value in obj]
+    if isinstance(obj, str):
+        return os.path.expandvars(obj)
+    return obj
+
+
+def _has_unresolved_env_ref(value: str) -> bool:
+    return bool(_ENV_REF.search(value))
 
 
 ALL_LENGTHS = [1024, 4096, 8192, 16384, 32768, 65536, 131072]
@@ -20,6 +55,16 @@ class EndpointConfig(BaseModel):
     @classmethod
     def strip_trailing_slash(cls, v: str) -> str:
         return v.rstrip("/")
+
+    @field_validator("api_key")
+    @classmethod
+    def validate_api_key_resolved(cls, v: str) -> str:
+        if _has_unresolved_env_ref(v):
+            raise ValueError(
+                f"api_key still contains an unresolved environment variable reference: {v!r}. "
+                "Set the variable in your shell or in a .env file next to the config / project root."
+            )
+        return v
 
 
 class RunConfig(BaseModel):
@@ -99,8 +144,11 @@ class BenchConfig(BaseModel):
 
     @classmethod
     def load(cls, path: str | Path) -> BenchConfig:
-        with open(path, encoding="utf-8") as f:
+        config_path = Path(path)
+        load_project_env(config_path=config_path)
+        with open(config_path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
+        data = expand_env_values(data)
         return cls.model_validate(data)
 
 

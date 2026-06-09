@@ -1,0 +1,38 @@
+endpoint:
+  base_url: "https://token-plan-sgp.xiaomimimo.com/anthropic"
+  api_type: "anthropic"
+  api_key: "$MIMO_API_KEY"
+  model: "mimo-v2.5"
+
+run:
+  repeats: 1
+  warmup: 0
+  decode_max_tokens: 2048      # large, so decode runs long enough to be measurable
+  ttft_only_max_tokens: 1
+  request_timeout_s: 600
+  concurrency_levels: [1]
+  max_cases_per_length: 1      # smoke: 1 case per length (formal uses all 10)
+
+matrix:
+  # Real, large contexts so TTFT/cache effects are visible (not just 1k noise)
+  context_lengths: [1024, 8192, 32768, 131072]
+  domains:
+    coding: { lengths: [1024, 8192, 32768, 131072] }
+  test_prefix_caching: true
+
+output:
+  dir: "results"
+
+# Load test (disabled by default; enable for throughput experiments)
+# load:
+#   enabled: false
+#   request_rate_sweep: [2, 8, .inf]   # .inf = full speed
+#   duration_s: 20
+#   max_concurrency: 8
+#   cache_hit_ratio: 0.5
+#   warmup_s: 5
+#   slo:
+#     ttft_ms: 5000
+#     tpot_ms: 50
+#   sample_domains: [coding]
+#   max_tokens: 512

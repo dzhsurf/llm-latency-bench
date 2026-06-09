@@ -35,6 +35,11 @@ Edit `config.yaml`:
 - **OpenAI-compatible**: `base_url: http://127.0.0.1:7575/v1`, `api_type: openai`
 - **Anthropic-compatible**: `base_url: http://127.0.0.1:7575`, `api_type: anthropic`
 
+Secrets can reference environment variables in the YAML, e.g. `api_key: "$GLM_API_KEY"`.
+On startup the tool loads `.env` from the project root (or next to the config file) if it
+exists; those values override the current shell environment. If `.env` is missing, only
+already-exported environment variables are used.
+
 ## Run
 
 ```bash
